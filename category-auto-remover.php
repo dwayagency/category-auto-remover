@@ -38,6 +38,11 @@ class Category_Auto_Remover {
     private static $categories_cache = null;
 
     public function __construct() {
+        // Debug: verifica che il plugin si stia caricando
+        if (defined('WP_DEBUG') && WP_DEBUG) {
+            error_log('Category Auto Remover: Plugin loaded successfully');
+        }
+        
         // Admin
         add_action('admin_menu', [$this, 'add_settings_page']);
         add_action('admin_init', [$this, 'register_settings']);
@@ -52,6 +57,9 @@ class Category_Auto_Remover {
 
         // Hook per cleanup quando necessario
         add_action('delete_category', [$this, 'cleanup_deleted_category']);
+        
+        // AJAX per applicazione bulk
+        add_action('wp_ajax_car_apply_bulk_rules', [$this, 'ajax_apply_bulk_rules']);
     }
 
     /**
@@ -70,6 +78,10 @@ class Category_Auto_Remover {
             .car-remove-row:hover { color: #dc3232; }
             .car-trigger, .car-remove { margin-bottom: 5px; }
             .car-add-rule { margin-top: 10px; }
+            .version { font-size: 0.6em; color: #666; font-weight: normal; }
+            .card { background: #fff; border: 1px solid #ccd0d4; box-shadow: 0 1px 1px rgba(0,0,0,.04); margin: 20px 0; padding: 20px; }
+            .card h2 { margin-top: 0; }
+            .progress-bar { margin: 10px 0; }
         ');
     }
 
@@ -121,12 +133,40 @@ class Category_Auto_Remover {
      * Pagina impostazioni con tab: Regole globali / Preferenze
      */
     public function add_settings_page() {
-        add_options_page(
+        // Debug: verifica che la funzione venga chiamata
+        if (defined('WP_DEBUG') && WP_DEBUG) {
+            error_log('Category Auto Remover: Adding settings page');
+        }
+        
+        // Menu principale separato
+        add_menu_page(
             __('Category Auto Remover', 'category-auto-remover'),
             __('Category Auto Remover', 'category-auto-remover'),
             'manage_options',
             'category-auto-remover',
+            [$this, 'render_settings_page'],
+            'dashicons-admin-tools',
+            30
+        );
+        
+        // Sottomenu per le impostazioni
+        add_submenu_page(
+            'category-auto-remover',
+            __('Impostazioni', 'category-auto-remover'),
+            __('Impostazioni', 'category-auto-remover'),
+            'manage_options',
+            'category-auto-remover',
             [$this, 'render_settings_page']
+        );
+        
+        // Sottomenu per applicare regole ai post esistenti
+        add_submenu_page(
+            'category-auto-remover',
+            __('Applica a Post Esistenti', 'category-auto-remover'),
+            __('Applica a Post Esistenti', 'category-auto-remover'),
+            'manage_options',
+            'category-auto-remover-bulk',
+            [$this, 'render_bulk_page']
         );
     }
 
@@ -563,6 +603,415 @@ class Category_Auto_Remover {
             
             add_action('save_post', [$this, 'maybe_remove_categories'], 20, 3);
         }
+    }
+
+    /**
+     * Pagina per applicare regole ai post esistenti
+     */
+    public function render_bulk_page() {
+        if (!current_user_can('manage_options')) {
+            wp_die(__('Non hai i permessi per accedere a questa pagina.', 'category-auto-remover'));
+        }
+
+        $rules = get_option(self::OPTION_KEY, []);
+        $prefs = wp_parse_args(get_option(self::OPTION_PREFS, []), [
+            'enable_metabox' => 1,
+            'post_types' => ['post'],
+        ]);
+
+        if (empty($rules)) {
+            ?>
+            <div class="wrap">
+                <h1><?php esc_html_e('Applica Regole a Post Esistenti', 'category-auto-remover'); ?></h1>
+                <div class="notice notice-warning">
+                    <p><?php esc_html_e('Nessuna regola globale configurata. Vai alle Impostazioni per creare delle regole.', 'category-auto-remover'); ?></p>
+                </div>
+            </div>
+            <?php
+            return;
+        }
+
+        // Conta i post che potrebbero essere interessati
+        $post_types = (array) $prefs['post_types'];
+        $total_posts = 0;
+        foreach ($post_types as $post_type) {
+            $count = wp_count_posts($post_type);
+            if ($count && isset($count->publish)) {
+                $total_posts += $count->publish;
+            }
+        }
+        
+        // Gestisci filtro per data
+        $date_filter = isset($_GET['date_filter']) ? sanitize_text_field($_GET['date_filter']) : '';
+        $date_from = isset($_GET['date_from']) ? sanitize_text_field($_GET['date_from']) : '';
+        $date_to = isset($_GET['date_to']) ? sanitize_text_field($_GET['date_to']) : '';
+        ?>
+        <div class="wrap">
+            <h1><?php esc_html_e('Applica Regole a Post Esistenti', 'category-auto-remover'); ?></h1>
+            
+            <div class="notice notice-info">
+                <p><strong><?php esc_html_e('Attenzione:', 'category-auto-remover'); ?></strong></p>
+                <ul>
+                    <li><?php esc_html_e('Questa operazione applicherà le regole globali a tutti i post pubblicati', 'category-auto-remover'); ?></li>
+                    <li><?php esc_html_e('I post con regole personalizzate (metabox) non verranno modificati', 'category-auto-remover'); ?></li>
+                    <li><?php esc_html_e('L\'operazione potrebbe richiedere del tempo per siti con molti post', 'category-auto-remover'); ?></li>
+                </ul>
+            </div>
+
+            <div class="card">
+                <h2><?php esc_html_e('Filtri Data', 'category-auto-remover'); ?></h2>
+                <form method="get" action="">
+                    <input type="hidden" name="page" value="category-auto-remover-bulk" />
+                    <table class="form-table">
+                        <tr>
+                            <th scope="row"><?php esc_html_e('Filtra per data', 'category-auto-remover'); ?></th>
+                            <td>
+                                <label>
+                                    <input type="radio" name="date_filter" value="" <?php checked($date_filter, ''); ?> />
+                                    <?php esc_html_e('Tutti i post', 'category-auto-remover'); ?>
+                                </label><br />
+                                <label>
+                                    <input type="radio" name="date_filter" value="from" <?php checked($date_filter, 'from'); ?> />
+                                    <?php esc_html_e('Post pubblicati dal', 'category-auto-remover'); ?>
+                                </label><br />
+                                <label>
+                                    <input type="radio" name="date_filter" value="range" <?php checked($date_filter, 'range'); ?> />
+                                    <?php esc_html_e('Post pubblicati tra', 'category-auto-remover'); ?>
+                                </label>
+                            </td>
+                        </tr>
+                        <tr id="date-from-row" style="<?php echo ($date_filter === 'from' || $date_filter === 'range') ? '' : 'display: none;'; ?>">
+                            <th scope="row"><?php esc_html_e('Data inizio', 'category-auto-remover'); ?></th>
+                            <td>
+                                <input type="date" name="date_from" value="<?php echo esc_attr($date_from); ?>" />
+                                <p class="description"><?php esc_html_e('Solo post pubblicati da questa data in poi', 'category-auto-remover'); ?></p>
+                            </td>
+                        </tr>
+                        <tr id="date-to-row" style="<?php echo ($date_filter === 'range') ? '' : 'display: none;'; ?>">
+                            <th scope="row"><?php esc_html_e('Data fine', 'category-auto-remover'); ?></th>
+                            <td>
+                                <input type="date" name="date_to" value="<?php echo esc_attr($date_to); ?>" />
+                                <p class="description"><?php esc_html_e('Solo post pubblicati fino a questa data', 'category-auto-remover'); ?></p>
+                            </td>
+                        </tr>
+                    </table>
+                    <?php submit_button(__('Applica Filtri', 'category-auto-remover'), 'secondary', 'apply_filters'); ?>
+                </form>
+            </div>
+
+            <div class="card">
+                <h2><?php esc_html_e('Statistiche', 'category-auto-remover'); ?></h2>
+                <?php
+                // Calcola post filtrati per data
+                $filtered_posts = $total_posts;
+                if ($date_filter === 'from' && $date_from) {
+                    $filtered_posts = $this->count_posts_by_date($post_types, $date_from, '');
+                } elseif ($date_filter === 'range' && $date_from && $date_to) {
+                    $filtered_posts = $this->count_posts_by_date($post_types, $date_from, $date_to);
+                }
+                ?>
+                <p><?php printf(__('Post totali: <strong>%d</strong>', 'category-auto-remover'), $total_posts); ?></p>
+                <p><?php printf(__('Post da processare: <strong>%d</strong>', 'category-auto-remover'), $filtered_posts); ?></p>
+                <p><?php printf(__('Regole globali configurate: <strong>%d</strong>', 'category-auto-remover'), count($rules)); ?></p>
+                <p><?php printf(__('Tipi di post interessati: <strong>%s</strong>', 'category-auto-remover'), implode(', ', $post_types)); ?></p>
+                <?php if ($date_filter): ?>
+                    <p><strong><?php esc_html_e('Filtro attivo:', 'category-auto-remover'); ?></strong> 
+                    <?php 
+                    if ($date_filter === 'from') {
+                        printf(__('Post dal %s', 'category-auto-remover'), $date_from);
+                    } elseif ($date_filter === 'range') {
+                        printf(__('Post dal %s al %s', 'category-auto-remover'), $date_from, $date_to);
+                    }
+                    ?>
+                    </p>
+                <?php endif; ?>
+            </div>
+
+            <div class="card">
+                <h2><?php esc_html_e('Regole che verranno applicate', 'category-auto-remover'); ?></h2>
+                <table class="widefat">
+                    <thead>
+                        <tr>
+                            <th><?php esc_html_e('Categoria Trigger', 'category-auto-remover'); ?></th>
+                            <th><?php esc_html_e('Categorie da Rimuovere', 'category-auto-remover'); ?></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ($rules as $rule): 
+                            $trigger_cat = get_term($rule['trigger'], 'category');
+                            $remove_cats = array_map(function($id) { return get_term($id, 'category'); }, $rule['remove']);
+                        ?>
+                        <tr>
+                            <td>
+                                <?php if ($trigger_cat && !is_wp_error($trigger_cat)): ?>
+                                    <strong><?php echo esc_html($trigger_cat->name); ?></strong> (ID: <?php echo esc_html($trigger_cat->term_id); ?>)
+                                <?php else: ?>
+                                    <em><?php esc_html_e('Categoria non trovata', 'category-auto-remover'); ?></em>
+                                <?php endif; ?>
+                            </td>
+                            <td>
+                                <?php 
+                                $valid_cats = array_filter($remove_cats, function($cat) { return $cat && !is_wp_error($cat); });
+                                if (!empty($valid_cats)):
+                                    $cat_names = array_map(function($cat) { return $cat->name . ' (ID: ' . $cat->term_id . ')'; }, $valid_cats);
+                                    echo esc_html(implode(', ', $cat_names));
+                                else:
+                                    echo '<em>' . esc_html__('Nessuna categoria valida', 'category-auto-remover') . '</em>';
+                                endif;
+                                ?>
+                            </td>
+                        </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="card">
+                <h2><?php esc_html_e('Avvia Processo', 'category-auto-remover'); ?></h2>
+                <p><?php esc_html_e('Clicca il pulsante qui sotto per iniziare ad applicare le regole ai post esistenti.', 'category-auto-remover'); ?></p>
+                
+                <button type="button" id="car-start-bulk" class="button button-primary button-large">
+                    <?php esc_html_e('Applica Regole ai Post Esistenti', 'category-auto-remover'); ?>
+                </button>
+                
+                <div id="car-progress" style="display: none; margin-top: 20px;">
+                    <div class="progress-bar" style="width: 100%; background-color: #f0f0f0; border-radius: 3px;">
+                        <div id="car-progress-bar" style="width: 0%; height: 20px; background-color: #0073aa; border-radius: 3px; transition: width 0.3s;"></div>
+                    </div>
+                    <p id="car-progress-text"><?php esc_html_e('Preparazione...', 'category-auto-remover'); ?></p>
+                </div>
+                
+                <div id="car-results" style="display: none; margin-top: 20px;">
+                    <h3><?php esc_html_e('Risultati', 'category-auto-remover'); ?></h3>
+                    <div id="car-results-content"></div>
+                </div>
+            </div>
+        </div>
+
+        <script>
+        jQuery(document).ready(function($) {
+            // Gestione filtri data
+            $('input[name="date_filter"]').on('change', function() {
+                var value = $(this).val();
+                if (value === 'from') {
+                    $('#date-from-row').show();
+                    $('#date-to-row').hide();
+                } else if (value === 'range') {
+                    $('#date-from-row').show();
+                    $('#date-to-row').show();
+                } else {
+                    $('#date-from-row').hide();
+                    $('#date-to-row').hide();
+                }
+            });
+            
+            $('#car-start-bulk').on('click', function() {
+                var button = $(this);
+                var progress = $('#car-progress');
+                var progressBar = $('#car-progress-bar');
+                var progressText = $('#car-progress-text');
+                var results = $('#car-results');
+                var resultsContent = $('#car-results-content');
+                
+                button.prop('disabled', true);
+                progress.show();
+                results.hide();
+                
+                var processed = 0;
+                var total = <?php echo $filtered_posts; ?>;
+                var updated = 0;
+                var skipped = 0;
+                
+                function processBatch() {
+                    $.ajax({
+                        url: ajaxurl,
+                        type: 'POST',
+                        data: {
+                            action: 'car_apply_bulk_rules',
+                            processed: processed,
+                            date_filter: '<?php echo esc_js($date_filter); ?>',
+                            date_from: '<?php echo esc_js($date_from); ?>',
+                            date_to: '<?php echo esc_js($date_to); ?>',
+                            nonce: '<?php echo wp_create_nonce('car_bulk_nonce'); ?>'
+                        },
+                        success: function(response) {
+                            if (response.success) {
+                                processed += response.data.processed;
+                                updated += response.data.updated;
+                                skipped += response.data.skipped;
+                                
+                                var percentage = Math.round((processed / total) * 100);
+                                progressBar.css('width', percentage + '%');
+                                progressText.text('Processati: ' + processed + '/' + total + ' (' + percentage + '%)');
+                                
+                                if (response.data.finished) {
+                                    button.prop('disabled', false);
+                                    progressText.text('<?php esc_html_e('Completato!', 'category-auto-remover'); ?>');
+                                    
+                                    resultsContent.html(
+                                        '<p><strong><?php esc_html_e('Post processati:', 'category-auto-remover'); ?></strong> ' + processed + '</p>' +
+                                        '<p><strong><?php esc_html_e('Post aggiornati:', 'category-auto-remover'); ?></strong> ' + updated + '</p>' +
+                                        '<p><strong><?php esc_html_e('Post saltati:', 'category-auto-remover'); ?></strong> ' + skipped + '</p>'
+                                    );
+                                    results.show();
+                                } else {
+                                    setTimeout(processBatch, 100);
+                                }
+                            } else {
+                                alert('Errore: ' + response.data);
+                                button.prop('disabled', false);
+                            }
+                        },
+                        error: function() {
+                            alert('<?php esc_html_e('Errore durante il processo', 'category-auto-remover'); ?>');
+                            button.prop('disabled', false);
+                        }
+                    });
+                }
+                
+                processBatch();
+            });
+        });
+        </script>
+        <?php
+    }
+
+    /**
+     * Conta i post per data
+     */
+    private function count_posts_by_date($post_types, $date_from = '', $date_to = '') {
+        $args = [
+            'post_type' => $post_types,
+            'post_status' => 'publish',
+            'fields' => 'ids',
+            'posts_per_page' => -1,
+        ];
+        
+        if ($date_from) {
+            $args['date_query'] = [
+                'after' => $date_from . ' 00:00:00',
+                'inclusive' => true,
+            ];
+        }
+        
+        if ($date_to) {
+            if (!isset($args['date_query'])) {
+                $args['date_query'] = [];
+            }
+            $args['date_query']['before'] = $date_to . ' 23:59:59';
+            $args['date_query']['inclusive'] = true;
+        }
+        
+        $posts = get_posts($args);
+        return count($posts);
+    }
+
+    /**
+     * AJAX handler per applicazione bulk delle regole
+     */
+    public function ajax_apply_bulk_rules() {
+        check_ajax_referer('car_bulk_nonce', 'nonce');
+        
+        if (!current_user_can('manage_options')) {
+            wp_die('Permessi insufficienti');
+        }
+
+        $processed = intval($_POST['processed']);
+        $batch_size = 10; // Processa 10 post alla volta
+        
+        // Parametri di filtro data
+        $date_filter = sanitize_text_field($_POST['date_filter'] ?? '');
+        $date_from = sanitize_text_field($_POST['date_from'] ?? '');
+        $date_to = sanitize_text_field($_POST['date_to'] ?? '');
+        
+        $rules = get_option(self::OPTION_KEY, []);
+        $prefs = wp_parse_args(get_option(self::OPTION_PREFS, []), [
+            'post_types' => ['post'],
+        ]);
+        
+        $post_types = (array) $prefs['post_types'];
+        $updated = 0;
+        $skipped = 0;
+        
+        // Ottieni i post da processare con filtri data
+        $args = [
+            'post_type' => $post_types,
+            'post_status' => 'publish',
+            'numberposts' => $batch_size,
+            'offset' => $processed,
+            'fields' => 'ids',
+            'orderby' => 'date',
+            'order' => 'ASC'
+        ];
+        
+        // Applica filtri data
+        if ($date_filter === 'from' && $date_from) {
+            $args['date_query'] = [
+                'after' => $date_from . ' 00:00:00',
+                'inclusive' => true,
+            ];
+        } elseif ($date_filter === 'range' && $date_from && $date_to) {
+            $args['date_query'] = [
+                'after' => $date_from . ' 00:00:00',
+                'before' => $date_to . ' 23:59:59',
+                'inclusive' => true,
+            ];
+        }
+        
+        $posts = get_posts($args);
+        
+        foreach ($posts as $post_id) {
+            // Controlla se il post ha regole personalizzate
+            $has_custom_rule = (int) get_post_meta($post_id, self::META_ENABLED, true);
+            
+            if ($has_custom_rule) {
+                $skipped++;
+                continue;
+            }
+            
+            // Applica le regole globali
+            $assigned_set = wp_get_post_categories($post_id, ['fields' => 'ids']);
+            if (is_wp_error($assigned_set) || empty($assigned_set)) {
+                $skipped++;
+                continue;
+            }
+            
+            $assigned_set = array_map('intval', (array)$assigned_set);
+            $original_set = $assigned_set;
+            $modified = false;
+            
+            foreach ($rules as $rule) {
+                if (!isset($rule['trigger']) || !isset($rule['remove'])) continue;
+                
+                $trigger = intval($rule['trigger']);
+                $remove  = array_map('intval', (array) ($rule['remove'] ?? []));
+                
+                if ($trigger && in_array($trigger, $assigned_set, true)) {
+                    $before = $assigned_set;
+                    $assigned_set = array_values(array_diff($assigned_set, $remove));
+                    if (!in_array($trigger, $assigned_set, true)) {
+                        $assigned_set[] = $trigger;
+                    }
+                    if ($before !== $assigned_set) $modified = true;
+                }
+            }
+            
+            if ($modified && $original_set !== $assigned_set) {
+                wp_set_post_categories($post_id, $assigned_set, false);
+                $updated++;
+            } else {
+                $skipped++;
+            }
+        }
+        
+        $finished = count($posts) < $batch_size;
+        
+        wp_send_json_success([
+            'processed' => count($posts),
+            'updated' => $updated,
+            'skipped' => $skipped,
+            'finished' => $finished
+        ]);
     }
 }
 
